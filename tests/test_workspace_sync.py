@@ -150,3 +150,36 @@ def test_restore_skips_when_no_bucket():
         s._s3 = MagicMock()
         s.restore("user123")
         s._s3.get_paginator.assert_not_called()
+
+
+def test_restore_mirror_removes_stale_files(tmp_workspace):
+    """Mirror restore should remove editable local files missing from S3."""
+    stale = tmp_workspace / "MEMORY.md"
+    stale.write_text("old")
+    paginator = MagicMock()
+    paginator.paginate.return_value = [{"Contents": [{"Key": "user123/.hermes/.workspace-version"}]}]
+
+    with patch.dict(os.environ, {
+        "S3_BUCKET": "test-bucket",
+        "WORKSPACE_PATH": str(tmp_workspace),
+    }):
+        s = WorkspaceSync()
+        s._s3 = MagicMock()
+        s._s3.get_paginator.return_value = paginator
+        s.restore("user123", mirror=True)
+
+    assert not stale.exists()
+
+
+def test_workspace_file_path_policy():
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "lambda", "router"))
+    from workspace_files import validate_workspace_path
+
+    assert validate_workspace_path("SOUL.md") == "SOUL.md"
+    assert validate_workspace_path("memories/team.md") == "memories/team.md"
+    with pytest.raises(ValueError):
+        validate_workspace_path("../SOUL.md")
+    with pytest.raises(ValueError):
+        validate_workspace_path("state.db")
+    with pytest.raises(ValueError):
+        validate_workspace_path("logs/app.log")

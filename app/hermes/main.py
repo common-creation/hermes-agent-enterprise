@@ -26,6 +26,8 @@ from typing import Any
 
 import httpx  # noqa: E402
 import anthropic  # noqa: E402
+import boto3  # noqa: E402
+from botocore.exceptions import ClientError  # noqa: E402
 
 _OrigAnthropic = anthropic.Anthropic
 
@@ -77,6 +79,102 @@ log = app.logger
 # ---------------------------------------------------------------------------
 
 _agent = None
+_workspace_sync = None
+_workspace_key = ""
+_workspace_version = ""
+
+
+def _workspace_marker_key(workspace_key: str) -> str:
+    return f"{workspace_key}/.hermes/.workspace-version"
+
+
+def _current_workspace_version(workspace_key: str) -> str:
+    bucket = os.environ.get("S3_BUCKET", "")
+    if not bucket or not workspace_key:
+        return ""
+    region = _get_region()
+    os.environ.setdefault("AWS_DEFAULT_REGION", region)
+    os.environ.setdefault("AWS_REGION", region)
+    try:
+        resp = boto3.client("s3").get_object(
+            Bucket=bucket,
+            Key=_workspace_marker_key(workspace_key),
+        )
+        body = resp["Body"].read()
+        return body.decode("utf-8")
+    except ClientError as exc:
+        code = exc.response.get("Error", {}).get("Code", "")
+        if code in ("NoSuchKey", "404"):
+            return ""
+        raise
+
+
+def _ensure_workspace(payload: dict) -> None:
+    """Restore the S3-backed workspace before creating/running the agent."""
+    global _agent, _workspace_key, _workspace_sync, _workspace_version
+
+    workspace_key = payload.get("workspaceKey", "")
+    if not workspace_key:
+        return
+    if payload.get("s3Bucket"):
+        os.environ["S3_BUCKET"] = payload["s3Bucket"]
+    if not os.environ.get("S3_BUCKET"):
+        log.warning("workspaceKey provided but S3_BUCKET is not configured")
+        return
+
+    latest_version = _current_workspace_version(workspace_key)
+    if _workspace_sync and _workspace_key == workspace_key and _workspace_version == latest_version:
+        return
+
+    from bridge.workspace_sync import WorkspaceSync
+
+    log.info("Restoring workspace (key=%s, version=%s)", workspace_key, latest_version)
+    sync = WorkspaceSync()
+    sync.restore(workspace_key, mirror=True)
+    _workspace_sync = sync
+    _workspace_key = workspace_key
+    _workspace_version = latest_version
+    _agent = None
+
+
+def _save_workspace() -> None:
+    if _workspace_sync and _workspace_key:
+        _workspace_sync.save(_workspace_key)
+
+
+def _get_secret(name: str) -> str:
+    env_name = name.upper().replace("-", "_")
+    if os.environ.get(env_name):
+        return os.environ[env_name]
+    region = _get_region()
+    os.environ.setdefault("AWS_DEFAULT_REGION", region)
+    os.environ.setdefault("AWS_REGION", region)
+    resp = boto3.client("secretsmanager").get_secret_value(SecretId=f"hermes/{name}")
+    return resp["SecretString"]
+
+
+def _quick_command_response(payload: dict) -> str:
+    from bridge.workspace_auth import sign_workspace_token
+
+    workspace_key = payload.get("workspaceKey", "")
+    ui_base_url = payload.get("uiBaseUrl") or os.environ.get("WORKSPACE_UI_BASE_URL", "")
+    if not workspace_key or not ui_base_url:
+        return "Workspace UI is not available for this request."
+
+    token_payload = {
+        "workspaceKey": workspace_key,
+        "workspaceType": payload.get("workspaceType", ""),
+        "teamId": payload.get("teamId", ""),
+        "channelId": payload.get("chatId", ""),
+        "actorId": payload.get("actorId", ""),
+        "scope": ["workspace:read", "workspace:write"],
+    }
+    token = sign_workspace_token(
+        token_payload,
+        _get_secret("workspace-ui-signing-key"),
+        ttl_seconds=int(os.environ.get("WORKSPACE_UI_TOKEN_TTL_SECONDS", "3600")),
+    )
+    return f"Workspace settings: {ui_base_url.rstrip('/')}/ui?token={token}"
 
 
 def get_or_create_agent():
@@ -124,6 +222,10 @@ def get_or_create_agent():
 
 def _sigterm_handler(signum: int, frame: Any) -> None:
     log.info("SIGTERM received — shutting down")
+    try:
+        _save_workspace()
+    except Exception as exc:
+        log.error("Workspace save failed during shutdown: %s", exc)
     sys.exit(0)
 
 
@@ -143,6 +245,11 @@ async def invoke(payload, context):
         return
 
     try:
+        if message.strip() == "/setting-ui":
+            yield _quick_command_response(payload)
+            return
+
+        _ensure_workspace(payload)
         agent = get_or_create_agent()
 
         system_extra = f"The user is contacting you via {channel}."
@@ -158,6 +265,7 @@ async def invoke(payload, context):
             system_message=system_extra,
             conversation_history=history,
         )
+        _save_workspace()
         yield result.get("final_response", "")
     except Exception as exc:
         log.error("Agent error: %s\n%s", exc, traceback.format_exc())

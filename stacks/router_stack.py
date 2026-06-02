@@ -123,11 +123,21 @@ class HermesRouterStack(Stack):
             )
         )
 
-        # Allow Lambda to write to S3 (photo uploads).
+        # Allow Lambda to manage S3 workspace files and photo uploads.
         self.router_fn.add_to_role_policy(
             iam.PolicyStatement(
-                actions=["s3:PutObject"],
+                actions=[
+                    "s3:DeleteObject",
+                    "s3:GetObject",
+                    "s3:PutObject",
+                ],
                 resources=[f"arn:aws:s3:::{bucket_name}/*"],
+            )
+        )
+        self.router_fn.add_to_role_policy(
+            iam.PolicyStatement(
+                actions=["s3:ListBucket"],
+                resources=[f"arn:aws:s3:::{bucket_name}"],
             )
         )
 
@@ -147,6 +157,14 @@ class HermesRouterStack(Stack):
             ("/webhook/slack", [apigwv2.HttpMethod.POST]),
             ("/webhook/discord", [apigwv2.HttpMethod.POST]),
             ("/webhook/feishu", [apigwv2.HttpMethod.POST]),
+            ("/slack/commands/setting-ui", [apigwv2.HttpMethod.POST]),
+            ("/ui", [apigwv2.HttpMethod.GET]),
+            ("/api/workspace/files", [apigwv2.HttpMethod.GET]),
+            ("/api/workspace/file", [
+                apigwv2.HttpMethod.GET,
+                apigwv2.HttpMethod.PUT,
+                apigwv2.HttpMethod.DELETE,
+            ]),
             ("/health", [apigwv2.HttpMethod.GET]),
         ]
         for path, methods in routes:

@@ -19,11 +19,20 @@ import logging
 import os
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from typing import Any
 
 import boto3
 from botocore.exceptions import ClientError
+
+from workspace_auth import sign_workspace_token, verify_workspace_token
+from workspace_files import (
+    delete_workspace_file,
+    get_workspace_file,
+    list_workspace_files,
+    put_workspace_file,
+)
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -37,6 +46,8 @@ s3 = boto3.client("s3")
 RUNTIME_ARN = os.environ.get("AGENTCORE_RUNTIME_ARN", "")
 QUALIFIER = os.environ.get("AGENTCORE_QUALIFIER", "")
 S3_BUCKET = os.environ.get("S3_BUCKET", "")
+WORKSPACE_UI_TOKEN_TTL_SECONDS = int(os.environ.get("WORKSPACE_UI_TOKEN_TTL_SECONDS", "3600"))
+SETTING_UI_COMMAND = "/setting-ui"
 
 # Conversation history limits.
 HISTORY_MAX_TURNS = int(os.environ.get("HISTORY_MAX_TURNS", "20"))
@@ -70,7 +81,13 @@ def handler(event: dict, context: Any) -> dict:
             _discord_followup(event["_discord_followup"])
             return _ok({"status": "ok"})
 
-        if path.startswith("/webhook/telegram"):
+        if path == "/ui":
+            return _handle_workspace_ui(event)
+        elif path.startswith("/api/workspace/"):
+            return _handle_workspace_api(event)
+        elif path.startswith("/slack/commands/setting-ui"):
+            return _handle_slack_setting_ui_command(event)
+        elif path.startswith("/webhook/telegram"):
             return _handle_telegram(event)
         elif path.startswith("/webhook/slack"):
             return _handle_slack(event)
@@ -233,13 +250,22 @@ def _handle_slack(event: dict) -> dict:
     text = slack_event.get("text", "")
     channel_id = slack_event.get("channel", "")
     user_id = slack_event.get("user", "")
+    team_id = body.get("team_id") or slack_event.get("team", "")
+    channel_type = slack_event.get("channel_type", "")
     actor_id = f"slack:{user_id}"
 
     if not text.strip() or not _is_allowed(actor_id):
         return _ok({"status": "blocked"})
 
+    workspace = _resolve_slack_workspace(team_id, channel_id, user_id, channel_type)
+    if text.strip() == SETTING_UI_COMMAND:
+        ui_url = _build_workspace_ui_url(event, workspace, actor_id)
+        _send_slack_ephemeral(channel_id, user_id, f"Workspace settings: {ui_url}")
+        return _ok({"status": "ok", "quickCommand": SETTING_UI_COMMAND})
+
     hermes_user_id = _resolve_user(actor_id)
-    session_id = _build_session_id(hermes_user_id, "slack")
+    session_id = _build_workspace_session_id(workspace["workspaceKey"])
+    ui_base_url = _base_url(event)
 
     payload = {
         "action": "chat",
@@ -248,6 +274,11 @@ def _handle_slack(event: dict) -> dict:
         "channel": "slack",
         "chatId": channel_id,
         "message": text,
+        "workspaceKey": workspace["workspaceKey"],
+        "workspaceType": workspace["workspaceType"],
+        "teamId": team_id,
+        "s3Bucket": S3_BUCKET,
+        "uiBaseUrl": ui_base_url,
     }
 
     agent_response = _invoke_agentcore(session_id, actor_id, payload)
@@ -260,7 +291,7 @@ def _handle_slack(event: dict) -> dict:
 
 def _verify_slack_signature(event: dict, signing_secret: str) -> bool:
     """Verify Slack request signing (v0)."""
-    headers = event.get("headers", {})
+    headers = {k.lower(): v for k, v in (event.get("headers", {}) or {}).items()}
     timestamp = headers.get("x-slack-request-timestamp", "")
     signature = headers.get("x-slack-signature", "")
     body = event.get("body", "")
@@ -277,6 +308,150 @@ def _verify_slack_signature(event: dict, signing_secret: str) -> bool:
         signing_secret.encode(), basestring.encode(), hashlib.sha256,
     ).hexdigest()
     return hmac.compare_digest(computed, signature)
+
+
+def _handle_slack_setting_ui_command(event: dict) -> dict:
+    signing_secret = _get_secret("slack-signing-secret")
+    if not _verify_slack_signature(event, signing_secret):
+        return _ok({"error": "Invalid signature"}, status=401)
+
+    form = _parse_form_body(event)
+    actor_id = f"slack:{form.get('user_id', '')}"
+    if not _is_allowed(actor_id):
+        return _slack_ephemeral("Access denied.")
+
+    team_id = form.get("team_id", "")
+    channel_id = form.get("channel_id", "")
+    user_id = form.get("user_id", "")
+    workspace = _resolve_slack_workspace(team_id, channel_id, user_id, "")
+    ui_url = _build_workspace_ui_url(event, workspace, actor_id)
+    return _slack_ephemeral(f"Workspace settings: {ui_url}")
+
+
+def _parse_form_body(event: dict) -> dict[str, str]:
+    body = event.get("body", "")
+    if event.get("isBase64Encoded") and body:
+        import base64
+        body = base64.b64decode(body).decode("utf-8")
+    parsed = urllib.parse.parse_qs(body, keep_blank_values=True)
+    return {key: values[-1] if values else "" for key, values in parsed.items()}
+
+
+def _slack_ephemeral(text: str) -> dict:
+    return _ok({"response_type": "ephemeral", "text": text})
+
+
+def _resolve_slack_workspace(
+    team_id: str,
+    channel_id: str,
+    user_id: str,
+    channel_type: str = "",
+) -> dict[str, str]:
+    """Resolve Slack conversation context to a workspace namespace."""
+    if not channel_type:
+        channel_type = _fetch_slack_channel_type(channel_id)
+
+    safe_team = _safe_workspace_component(team_id or "unknown-team")
+    safe_channel = _safe_workspace_component(channel_id or "unknown-channel")
+    safe_user = _safe_workspace_component(user_id or "unknown-user")
+
+    if channel_type == "im":
+        return {
+            "workspaceKey": f"slack/{safe_team}/users/{safe_user}",
+            "workspaceType": "slack-dm",
+        }
+    if channel_type == "mpim":
+        return {
+            "workspaceKey": f"slack/{safe_team}/mpim/{safe_channel}",
+            "workspaceType": "slack-mpim",
+        }
+    if channel_type == "group":
+        return {
+            "workspaceKey": f"slack/{safe_team}/private/{safe_channel}",
+            "workspaceType": "slack-private-channel",
+        }
+    return {
+        "workspaceKey": f"slack/{safe_team}/channels/public-shared",
+        "workspaceType": "slack-public-shared",
+    }
+
+
+def _fetch_slack_channel_type(channel_id: str) -> str:
+    if not channel_id:
+        return "channel"
+    token = _get_secret("slack-bot-token")
+    query = urllib.parse.urlencode({"channel": channel_id})
+    req = urllib.request.Request(
+        f"https://slack.com/api/conversations.info?{query}",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    try:
+        resp = json.loads(urllib.request.urlopen(req, timeout=10).read())
+    except Exception as exc:
+        logger.warning("Slack conversations.info failed: %s", exc)
+        return _infer_slack_channel_type(channel_id)
+
+    channel = resp.get("channel", {}) if resp.get("ok") else {}
+    if not channel:
+        return _infer_slack_channel_type(channel_id)
+    if channel.get("is_im"):
+        return "im"
+    if channel.get("is_mpim"):
+        return "mpim"
+    if channel.get("is_group") or channel.get("is_private"):
+        return "group"
+    return "channel"
+
+
+def _infer_slack_channel_type(channel_id: str) -> str:
+    if channel_id.startswith("D"):
+        return "im"
+    if channel_id.startswith("G"):
+        return "group"
+    return "channel"
+
+
+def _safe_workspace_component(value: str) -> str:
+    return "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in value)
+
+
+def _build_workspace_session_id(workspace_key: str) -> str:
+    digest = hashlib.sha256(workspace_key.encode("utf-8")).hexdigest()[:48]
+    return f"ws:{digest}"
+
+
+def _build_workspace_ui_url(event: dict, workspace: dict[str, str], actor_id: str) -> str:
+    token = _create_workspace_ui_token(workspace, actor_id)
+    return f"{_base_url(event)}/ui?token={urllib.parse.quote(token)}"
+
+
+def _create_workspace_ui_token(workspace: dict[str, str], actor_id: str) -> str:
+    parts = workspace["workspaceKey"].split("/")
+    team_id = parts[1] if len(parts) > 1 else ""
+    channel_id = parts[-1] if workspace["workspaceType"] != "slack-dm" else ""
+    payload = {
+        "workspaceKey": workspace["workspaceKey"],
+        "workspaceType": workspace["workspaceType"],
+        "teamId": team_id,
+        "channelId": channel_id,
+        "actorId": actor_id,
+        "scope": ["workspace:read", "workspace:write"],
+    }
+    return sign_workspace_token(
+        payload,
+        _get_workspace_ui_signing_key(),
+        ttl_seconds=WORKSPACE_UI_TOKEN_TTL_SECONDS,
+    )
+
+
+def _base_url(event: dict) -> str:
+    headers = {k.lower(): v for k, v in (event.get("headers", {}) or {}).items()}
+    host = headers.get("host")
+    if host:
+        proto = headers.get("x-forwarded-proto") or "https"
+        return f"{proto}://{host}"
+    domain = event.get("requestContext", {}).get("domainName", "")
+    return f"https://{domain}" if domain else os.environ.get("WORKSPACE_UI_BASE_URL", "")
 
 
 def _send_slack_message(channel: str, text: str, thread_ts: str | None = None) -> None:
@@ -301,6 +476,94 @@ def _send_slack_message(channel: str, text: str, thread_ts: str | None = None) -
         urllib.request.urlopen(req, timeout=15)
     except Exception as exc:
         logger.error("Slack chat.postMessage failed: %s", exc)
+
+
+def _send_slack_ephemeral(channel: str, user: str, text: str) -> None:
+    """Post a user-only Slack message."""
+    if not text:
+        return
+    token = _get_secret("slack-bot-token")
+    url = "https://slack.com/api/chat.postEphemeral"
+    data = json.dumps({
+        "channel": channel,
+        "user": user,
+        "text": text,
+    }).encode()
+    req = urllib.request.Request(url, data=data, headers={
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {token}",
+    })
+    try:
+        urllib.request.urlopen(req, timeout=15)
+    except Exception as exc:
+        logger.error("Slack chat.postEphemeral failed: %s", exc)
+
+
+# --------------------------------------------------------------------------
+# Workspace UI/API
+# --------------------------------------------------------------------------
+
+def _handle_workspace_ui(event: dict) -> dict:
+    static_path = os.path.join(os.path.dirname(__file__), "static", "index.html")
+    with open(static_path, "r", encoding="utf-8") as fh:
+        html = fh.read()
+    return _response(html, content_type="text/html; charset=utf-8")
+
+
+def _handle_workspace_api(event: dict) -> dict:
+    try:
+        claims = _workspace_claims(event)
+        workspace_key = claims["workspaceKey"]
+        method = event.get("requestContext", {}).get("http", {}).get("method", "GET")
+        path = event.get("rawPath", "")
+        params = event.get("queryStringParameters") or {}
+
+        if path.endswith("/files") and method == "GET":
+            return _ok({"files": list_workspace_files(s3, S3_BUCKET, workspace_key)})
+        if path.endswith("/file"):
+            file_path = params.get("path", "")
+            if method == "GET":
+                return _ok(get_workspace_file(s3, S3_BUCKET, workspace_key, file_path))
+            if method == "PUT":
+                _require_workspace_write(claims)
+                body = _parse_body(event)
+                content = body.get("content", "") if isinstance(body, dict) else ""
+                return _ok(put_workspace_file(s3, S3_BUCKET, workspace_key, file_path, content))
+            if method == "DELETE":
+                _require_workspace_write(claims)
+                return _ok(delete_workspace_file(s3, S3_BUCKET, workspace_key, file_path))
+        return _ok({"error": "Not found"}, status=404)
+    except ValueError as exc:
+        return _ok({"error": str(exc)}, status=400)
+    except ClientError as exc:
+        code = exc.response.get("Error", {}).get("Code", "")
+        status = 404 if code in ("NoSuchKey", "NoSuchBucket", "404") else 500
+        return _ok({"error": code or str(exc)}, status=status)
+
+
+def _workspace_claims(event: dict) -> dict:
+    token = _bearer_token(event)
+    if not token:
+        raise ValueError("missing token")
+    claims = verify_workspace_token(token, _get_workspace_ui_signing_key())
+    scopes = claims.get("scope", [])
+    if "workspace:read" not in scopes:
+        raise ValueError("token missing workspace scope")
+    return claims
+
+
+def _require_workspace_write(claims: dict) -> None:
+    if "workspace:write" not in claims.get("scope", []):
+        raise ValueError("token missing workspace write scope")
+
+
+def _bearer_token(event: dict) -> str:
+    headers = {k.lower(): v for k, v in (event.get("headers", {}) or {}).items()}
+    auth = headers.get("authorization") or ""
+    if auth.lower().startswith("bearer "):
+        return auth.split(" ", 1)[1].strip()
+    params = event.get("queryStringParameters") or {}
+    return params.get("token", "")
 
 
 # --------------------------------------------------------------------------
@@ -744,6 +1007,13 @@ def _get_secret(name: str) -> str:
     return value
 
 
+def _get_workspace_ui_signing_key() -> str:
+    env_key = os.environ.get("WORKSPACE_UI_SIGNING_KEY", "")
+    if env_key:
+        return env_key
+    return _get_secret("workspace-ui-signing-key")
+
+
 # --------------------------------------------------------------------------
 # Helpers
 # --------------------------------------------------------------------------
@@ -778,8 +1048,12 @@ def _split_message(text: str, max_len: int = 4096) -> list[str]:
 
 
 def _ok(body: dict, status: int = 200) -> dict:
+    return _response(json.dumps(body), status=status, content_type="application/json")
+
+
+def _response(body: str, status: int = 200, content_type: str = "text/plain; charset=utf-8") -> dict:
     return {
         "statusCode": status,
-        "headers": {"Content-Type": "application/json"},
-        "body": json.dumps(body),
+        "headers": {"Content-Type": content_type},
+        "body": body,
     }

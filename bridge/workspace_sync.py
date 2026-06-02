@@ -57,7 +57,7 @@ class WorkspaceSync:
     # Restore
     # ------------------------------------------------------------------
 
-    def restore(self, namespace: str) -> None:
+    def restore(self, namespace: str, mirror: bool = False) -> None:
         """Download the workspace from S3 on container init."""
         if not self.bucket:
             logger.info("No S3_BUCKET — workspace restore skipped")
@@ -66,6 +66,7 @@ class WorkspaceSync:
         prefix = f"{namespace}/.hermes/"
         logger.info("Restoring workspace from s3://%s/%s …", self.bucket, prefix)
         count = 0
+        restored: set[str] = set()
 
         try:
             paginator = self._s3.get_paginator("list_objects_v2")
@@ -78,10 +79,14 @@ class WorkspaceSync:
                     local_path = self.workspace / relative
                     local_path.parent.mkdir(parents=True, exist_ok=True)
                     self._s3.download_file(self.bucket, key, str(local_path))
+                    restored.add(relative)
                     count += 1
         except ClientError as exc:
             logger.warning("S3 restore error: %s", exc)
             return
+
+        if mirror and restored:
+            self._remove_local_files_missing_from_s3(restored)
 
         # Integrity-check restored SQLite databases.
         for db_file in self.workspace.glob("*.db"):
@@ -171,6 +176,23 @@ class WorkspaceSync:
             if fnmatch(relative, pattern) or fnmatch(relative, f"*/{pattern}"):
                 return True
         return False
+
+    def _remove_local_files_missing_from_s3(self, restored: set[str]) -> None:
+        """Delete local synced files that no longer exist in S3."""
+        for path in sorted(self.workspace.rglob("*"), reverse=True):
+            if path.is_dir():
+                try:
+                    path.rmdir()
+                except OSError:
+                    pass
+                continue
+            relative = str(path.relative_to(self.workspace))
+            if self._should_skip(relative) or relative in restored:
+                continue
+            try:
+                path.unlink(missing_ok=True)
+            except OSError as exc:
+                logger.warning("Could not remove stale workspace file %s: %s", relative, exc)
 
     @staticmethod
     def _sqlite_backup(src: Path, dst: Path) -> None:

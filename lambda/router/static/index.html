@@ -1,0 +1,197 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Hermes Workspace</title>
+  <style>
+    :root {
+      color-scheme: light;
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: #f6f7f9;
+      color: #1f2933;
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; min-height: 100vh; }
+    header {
+      height: 56px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0 20px;
+      border-bottom: 1px solid #d9dee7;
+      background: #ffffff;
+    }
+    main {
+      display: grid;
+      grid-template-columns: 280px minmax(0, 1fr);
+      min-height: calc(100vh - 56px);
+    }
+    aside {
+      border-right: 1px solid #d9dee7;
+      background: #ffffff;
+      padding: 12px;
+      overflow: auto;
+    }
+    section { padding: 16px; min-width: 0; }
+    .toolbar { display: flex; gap: 8px; align-items: center; }
+    button, input {
+      border: 1px solid #c5ccd8;
+      background: #ffffff;
+      border-radius: 6px;
+      min-height: 34px;
+      padding: 0 10px;
+      font: inherit;
+    }
+    button { cursor: pointer; }
+    button.primary { background: #1463ff; color: #ffffff; border-color: #1463ff; }
+    button.danger { color: #b42318; border-color: #f3b8b0; }
+    input { width: min(520px, 100%); }
+    ul { list-style: none; margin: 0; padding: 0; }
+    li button {
+      width: 100%;
+      text-align: left;
+      border: 0;
+      background: transparent;
+      border-radius: 4px;
+      padding: 8px;
+      overflow-wrap: anywhere;
+    }
+    li button:hover, li button.active { background: #edf2ff; }
+    textarea {
+      width: 100%;
+      height: calc(100vh - 156px);
+      min-height: 320px;
+      resize: vertical;
+      border: 1px solid #c5ccd8;
+      border-radius: 6px;
+      padding: 12px;
+      font: 14px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+      background: #ffffff;
+      color: #111827;
+    }
+    .status { color: #596579; font-size: 13px; overflow-wrap: anywhere; }
+    .editor-head {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 12px;
+    }
+    .editor-actions { display: flex; gap: 8px; }
+    @media (max-width: 760px) {
+      main { grid-template-columns: 1fr; }
+      aside { border-right: 0; border-bottom: 1px solid #d9dee7; max-height: 240px; }
+      textarea { height: 50vh; }
+      .editor-head { align-items: stretch; flex-direction: column; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <strong>Hermes Workspace</strong>
+    <span id="status" class="status"></span>
+  </header>
+  <main>
+    <aside>
+      <div class="toolbar">
+        <button id="refresh">Refresh</button>
+        <button id="newFile">New</button>
+      </div>
+      <ul id="files"></ul>
+    </aside>
+    <section>
+      <div class="editor-head">
+        <input id="path" placeholder="SOUL.md or memories/example.md">
+        <div class="editor-actions">
+          <button class="primary" id="save">Save</button>
+          <button class="danger" id="delete">Delete</button>
+        </div>
+      </div>
+      <textarea id="content" spellcheck="false"></textarea>
+    </section>
+  </main>
+  <script>
+    const params = new URLSearchParams(location.search);
+    const token = params.get("token") || sessionStorage.getItem("workspaceToken") || "";
+    if (params.get("token")) {
+      sessionStorage.setItem("workspaceToken", params.get("token"));
+      history.replaceState(null, "", location.pathname);
+    }
+    const statusEl = document.getElementById("status");
+    const filesEl = document.getElementById("files");
+    const pathEl = document.getElementById("path");
+    const contentEl = document.getElementById("content");
+    let activePath = "";
+
+    function setStatus(text) { statusEl.textContent = text; }
+    async function api(path, options = {}) {
+      const headers = Object.assign({"Authorization": `Bearer ${token}`}, options.headers || {});
+      if (options.body !== undefined) headers["Content-Type"] = "application/json";
+      const res = await fetch(path, Object.assign({}, options, {headers}));
+      const text = await res.text();
+      let data = {};
+      try { data = text ? JSON.parse(text) : {}; } catch { data = {error: text}; }
+      if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+      return data;
+    }
+    async function loadFiles() {
+      setStatus("Loading");
+      const data = await api("/api/workspace/files");
+      filesEl.innerHTML = "";
+      for (const file of data.files || []) {
+        const li = document.createElement("li");
+        const btn = document.createElement("button");
+        btn.textContent = file.path;
+        btn.className = file.path === activePath ? "active" : "";
+        btn.onclick = () => openFile(file.path);
+        li.appendChild(btn);
+        filesEl.appendChild(li);
+      }
+      setStatus(`${(data.files || []).length} files`);
+    }
+    async function openFile(path) {
+      activePath = path;
+      const data = await api(`/api/workspace/file?path=${encodeURIComponent(path)}`);
+      pathEl.value = data.path;
+      contentEl.value = data.content || "";
+      await loadFiles();
+    }
+    async function saveFile() {
+      const path = pathEl.value.trim();
+      if (!path) return setStatus("Path is required");
+      const data = await api(`/api/workspace/file?path=${encodeURIComponent(path)}`, {
+        method: "PUT",
+        body: JSON.stringify({content: contentEl.value})
+      });
+      activePath = data.path;
+      setStatus(`Saved ${data.path}`);
+      await loadFiles();
+    }
+    async function deleteFile() {
+      const path = pathEl.value.trim();
+      if (!path || !confirm(`Delete ${path}?`)) return;
+      await api(`/api/workspace/file?path=${encodeURIComponent(path)}`, {method: "DELETE"});
+      activePath = "";
+      pathEl.value = "";
+      contentEl.value = "";
+      setStatus(`Deleted ${path}`);
+      await loadFiles();
+    }
+    document.getElementById("refresh").onclick = () => loadFiles().catch(err => setStatus(err.message));
+    document.getElementById("newFile").onclick = () => {
+      activePath = "";
+      pathEl.value = "memories/new-note.md";
+      contentEl.value = "";
+      setStatus("New file");
+    };
+    document.getElementById("save").onclick = () => saveFile().catch(err => setStatus(err.message));
+    document.getElementById("delete").onclick = () => deleteFile().catch(err => setStatus(err.message));
+    if (!token) {
+      setStatus("Missing token");
+    } else {
+      loadFiles().catch(err => setStatus(err.message));
+    }
+  </script>
+</body>
+</html>

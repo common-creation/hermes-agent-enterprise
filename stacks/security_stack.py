@@ -50,6 +50,7 @@ class HermesSecurityStack(Stack):
             "feishu-encrypt-key",
             "openai-api-key",
             "openrouter-api-key",
+            "workspace-ui-signing-key",
         ]
         self.secrets: dict[str, sm.Secret] = {}
         for name in secret_names:
