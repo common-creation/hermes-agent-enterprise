@@ -150,8 +150,12 @@ Sent by the Cron Lambda via EventBridge Scheduler.
   "action": "cron",
   "userId": "user_abc123def456",
   "jobId": "job_daily_summary",
+  "workspaceKey": "slack/T1/users/U123",
+  "workspaceType": "slack-dm",
   "config": {
     "prompt": "Summarize today's news about AI",
+    "workspaceKey": "slack/T1/users/U123",
+    "workspaceType": "slack-dm",
     "delivery": {
       "channel": "telegram",
       "chatId": "123456789"

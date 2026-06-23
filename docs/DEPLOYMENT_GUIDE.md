@@ -1131,9 +1131,11 @@ aws scheduler create-schedule \
       --stack-name hermes-agentcore-cron \
       --query "Stacks[0].Outputs[?OutputKey=='"'"'SchedulerRoleArn'"'"'].OutputValue" \
       --output text)'",
-    "Input": "{\"jobId\":\"daily_summary\",\"userId\":\"user_abc123\",\"prompt\":\"Summarize today AI news\",\"delivery\":{\"channel\":\"telegram\",\"chatId\":\"123456789\"}}"
+    "Input": "{\"jobId\":\"daily_summary\",\"userId\":\"user_abc123\",\"workspaceKey\":\"slack/T1/users/U123\",\"workspaceType\":\"slack-dm\",\"prompt\":\"Summarize today AI news\",\"delivery\":{\"channel\":\"telegram\",\"chatId\":\"123456789\"}}"
   }'
 ```
+
+`workspaceKey` を指定すると、その Cron は該当 workspace の S3 prefix を復元して実行されます。Slack の通常メッセージと同じ namespace を使う場合は、DM なら `slack/{teamId}/users/{userId}`、MPIM なら `slack/{teamId}/mpim/{channelId}`、private channel なら `slack/{teamId}/private/{channelId}`、public channel 共有なら `slack/{teamId}/channels/public-shared` を指定します。
 
 ### 管理用户白名单
 
