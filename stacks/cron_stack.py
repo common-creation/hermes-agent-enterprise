@@ -27,6 +27,7 @@ class HermesCronStack(Stack):
         *,
         agentcore_runtime_arn: str = "",
         agentcore_qualifier: str = "",
+        bucket_name: str = "",
         **kwargs,
     ) -> None:
         super().__init__(scope, construct_id, **kwargs)
@@ -49,6 +50,7 @@ class HermesCronStack(Stack):
             environment={
                 "AGENTCORE_RUNTIME_ARN": agentcore_runtime_arn,
                 "AGENTCORE_QUALIFIER": agentcore_qualifier,
+                "S3_BUCKET": bucket_name,
             },
             log_retention=logs.RetentionDays.ONE_MONTH,
         )

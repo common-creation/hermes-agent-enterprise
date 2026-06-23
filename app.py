@@ -75,7 +75,9 @@ cron_stack = HermesCronStack(
     f"{project}-cron",
     agentcore_runtime_arn=agentcore_runtime_arn,
     agentcore_qualifier=agentcore_qualifier,
+    bucket_name=agentcore_stack.bucket.bucket_name,
 )
+cron_stack.add_dependency(agentcore_stack)
 
 token_monitoring_stack = HermesTokenMonitoringStack(
     app,

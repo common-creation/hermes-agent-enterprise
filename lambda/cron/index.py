@@ -18,6 +18,7 @@ import logging
 import os
 import time
 import urllib.request
+import hashlib
 from typing import Any
 
 import boto3
@@ -27,6 +28,7 @@ logger.setLevel(logging.INFO)
 
 RUNTIME_ARN = os.environ.get("AGENTCORE_RUNTIME_ARN", "")
 QUALIFIER = os.environ.get("AGENTCORE_QUALIFIER", "")
+S3_BUCKET = os.environ.get("S3_BUCKET", "")
 
 _agentcore_client: Any = None
 
@@ -57,16 +59,16 @@ def handler(event: dict, context: Any) -> dict:
     job_id = event.get("jobId", f"cron_{int(time.time())}")
     user_id = event.get("userId", "")
     prompt = event.get("prompt", "")
+    workspace_key = event.get("workspaceKey", "")
+    workspace_type = event.get("workspaceType", "")
     delivery = event.get("delivery", {})
 
     if not user_id or not prompt:
         logger.error("Missing userId or prompt in cron event")
         return {"status": "error", "reason": "missing userId or prompt"}
 
-    # Build session ID.
-    session_id = f"{user_id}:cron:{job_id}"
-    if len(session_id) < 33:
-        session_id = session_id + ":" + "0" * (33 - len(session_id) - 1)
+    session_id = _build_cron_session_id(user_id, job_id, workspace_key)
+    runtime_user_id = _build_runtime_user_id(user_id, workspace_key)
 
     # Invoke AgentCore with cron action.
     payload = {
@@ -76,9 +78,14 @@ def handler(event: dict, context: Any) -> dict:
         "channel": "cron",
         "message": prompt,
         "jobId": job_id,
+        "workspaceKey": workspace_key,
+        "workspaceType": workspace_type,
+        "s3Bucket": event.get("s3Bucket", S3_BUCKET),
         "config": {
             "prompt": prompt,
             "delivery": delivery,
+            "workspaceKey": workspace_key,
+            "workspaceType": workspace_type,
         },
     }
 
@@ -87,7 +94,7 @@ def handler(event: dict, context: Any) -> dict:
             agentRuntimeArn=RUNTIME_ARN,
             qualifier=QUALIFIER,
             runtimeSessionId=session_id,
-            runtimeUserId=f"cron:{user_id}",
+            runtimeUserId=runtime_user_id,
             payload=json.dumps(payload),
             contentType="application/json",
             accept="application/json",
@@ -107,6 +114,31 @@ def handler(event: dict, context: Any) -> dict:
         "jobId": job_id,
         "responseLength": len(agent_response),
     }
+
+
+def _build_cron_session_id(user_id: str, job_id: str, workspace_key: str = "") -> str:
+    """Build a stable AgentCore session ID, scoped by workspace when present."""
+    scope = _workspace_scope(workspace_key) if workspace_key else _safe_id(user_id)
+    session_id = f"{scope}:cron:{_safe_id(job_id)}"
+    if len(session_id) < 33:
+        session_id = session_id + ":" + "0" * (33 - len(session_id) - 1)
+    return session_id
+
+
+def _build_runtime_user_id(user_id: str, workspace_key: str = "") -> str:
+    """Keep workspace cron executions isolated at the AgentCore runtime layer."""
+    if workspace_key:
+        return f"cron:{_workspace_scope(workspace_key)}"
+    return f"cron:{_safe_id(user_id)}"
+
+
+def _workspace_scope(workspace_key: str) -> str:
+    digest = hashlib.sha256(workspace_key.encode("utf-8")).hexdigest()[:48]
+    return f"workspace:{digest}"
+
+
+def _safe_id(value: str) -> str:
+    return "".join(ch if ch.isalnum() or ch in ("_", "-", ".") else "_" for ch in value)
 
 
 def _deliver(delivery: dict, text: str, job_id: str) -> None:

@@ -46,6 +46,7 @@ class _State:
     start_time: float = time.time()
 
     workspace_sync: Any = None        # WorkspaceSync instance (set after init)
+    workspace_namespace: str = ""
 
 
 S = _State()
@@ -150,11 +151,15 @@ class AgentCoreHandler(BaseHTTPRequestHandler):
     # -- cron --
 
     def _handle_cron(self, body: dict) -> dict:
+        _ensure_request_workspace(body)
         if not S.agent_ready:
-            return {"response": "Agent not ready for cron execution", "ready": False}
+            _init_full_agent()
+            if not S.agent_ready:
+                return {"response": "Agent not ready for cron execution", "ready": False}
         prompt = body.get("config", {}).get("prompt", body.get("message", ""))
         user_id = body.get("userId", "cron")
         resp = _run_full_agent(user_id, prompt, "cron", body)
+        _save_workspace()
         return {"response": resp, "jobId": body.get("jobId", "")}
 
     # -- status --
@@ -291,9 +296,47 @@ def _init_workspace_sync() -> None:
         sync.restore(namespace)
         sync.start_periodic_save(namespace)
         S.workspace_sync = sync
+        S.workspace_namespace = namespace
         logger.info("Workspace sync initialised (bucket=%s, ns=%s)", bucket, namespace)
     except Exception as exc:
         logger.warning("Workspace sync init failed: %s", exc)
+
+
+def _ensure_request_workspace(body: dict) -> None:
+    """Restore the workspace named by a request payload when provided."""
+    namespace = body.get("workspaceKey") or body.get("config", {}).get("workspaceKey", "")
+    if not namespace:
+        return
+    if body.get("s3Bucket"):
+        os.environ["S3_BUCKET"] = body["s3Bucket"]
+    bucket = os.environ.get("S3_BUCKET", "")
+    if not bucket:
+        logger.warning("workspaceKey provided but S3_BUCKET is not configured")
+        return
+    if S.workspace_sync and S.workspace_namespace == namespace:
+        return
+
+    try:
+        if S.workspace_sync and S.workspace_namespace:
+            S.workspace_sync.save(S.workspace_namespace)
+
+        from bridge.workspace_sync import WorkspaceSync  # noqa: WPS433
+
+        sync = WorkspaceSync()
+        sync.restore(namespace, mirror=True)
+        S.workspace_sync = sync
+        S.workspace_namespace = namespace
+        S.agent = None
+        S.agent_ready = False
+        logger.info("Request workspace restored (bucket=%s, ns=%s)", bucket, namespace)
+    except Exception as exc:
+        logger.warning("Request workspace restore failed: %s", exc)
+
+
+def _save_workspace() -> None:
+    namespace = S.workspace_namespace or os.environ.get("AGENTCORE_USER_NAMESPACE", "")
+    if S.workspace_sync and namespace:
+        S.workspace_sync.save(namespace)
 
 
 # ---------------------------------------------------------------------------
@@ -303,10 +346,8 @@ def _init_workspace_sync() -> None:
 def _sigterm_handler(signum: int, frame: Any) -> None:  # noqa: ANN401
     logger.info("SIGTERM received — saving state …")
     try:
-        namespace = os.environ.get("AGENTCORE_USER_NAMESPACE", "")
-        if S.workspace_sync and namespace:
-            S.workspace_sync.save(namespace)
-            logger.info("Final workspace save complete")
+        _save_workspace()
+        logger.info("Final workspace save complete")
     except Exception as exc:
         logger.error("Failed to save state on shutdown: %s", exc)
     sys.exit(0)
