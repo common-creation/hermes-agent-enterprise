@@ -47,7 +47,13 @@ RUNTIME_ARN = os.environ.get("AGENTCORE_RUNTIME_ARN", "")
 QUALIFIER = os.environ.get("AGENTCORE_QUALIFIER", "")
 S3_BUCKET = os.environ.get("S3_BUCKET", "")
 WORKSPACE_UI_TOKEN_TTL_SECONDS = int(os.environ.get("WORKSPACE_UI_TOKEN_TTL_SECONDS", "3600"))
-SETTING_UI_COMMAND = "/setting-ui"
+SETTING_UI_COMMAND = "/hermes-agent-setting-ui"
+ALLOW_ALL_SLACK_USERS = os.environ.get("ALLOW_ALL_SLACK_USERS", "false").lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
 
 # Conversation history limits.
 HISTORY_MAX_TURNS = int(os.environ.get("HISTORY_MAX_TURNS", "20"))
@@ -967,6 +973,9 @@ def _resolve_user(actor_id: str, username: str = "") -> str:
 
 def _is_allowed(actor_id: str) -> bool:
     """Check whether *actor_id* is on the allowlist."""
+    if actor_id.startswith("slack:") and ALLOW_ALL_SLACK_USERS:
+        return True
+
     # If IDENTITY_TABLE is not set, allow all (dev mode).
     if not os.environ.get("IDENTITY_TABLE"):
         return True

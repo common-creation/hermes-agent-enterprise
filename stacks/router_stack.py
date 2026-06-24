@@ -40,6 +40,12 @@ class HermesRouterStack(Stack):
         project = self.node.try_get_context("project_name") or "hermes-agentcore"
         region = Stack.of(self).region
         account = Stack.of(self).account
+        allow_all_slack_users_value = str(
+            self.node.try_get_context("allow_all_slack_users") or "false",
+        ).lower()
+        allow_all_slack_users = (
+            "true" if allow_all_slack_users_value in {"1", "true", "yes", "on"} else "false"
+        )
 
         # ---- DynamoDB identity table -------------------------------------
 
@@ -84,6 +90,7 @@ class HermesRouterStack(Stack):
                 "AGENTCORE_QUALIFIER": agentcore_qualifier,
                 "IDENTITY_TABLE": self.identity_table.table_name,
                 "S3_BUCKET": bucket_name,
+                "ALLOW_ALL_SLACK_USERS": allow_all_slack_users,
             },
             log_retention=logs.RetentionDays.ONE_MONTH,
         )

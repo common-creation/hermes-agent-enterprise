@@ -77,6 +77,14 @@ phase2() {
         npm install -g @aws/agentcore
     fi
 
+    # The AgentCore CLI runs the CDK app from agentcore/cdk, so its package
+    # dependencies must be installed there before `agentcore deploy` invokes
+    # `npm run build`.
+    if [ ! -d "$PROJECT_DIR/agentcore/cdk/node_modules" ]; then
+        info "Installing AgentCore CDK dependencies …"
+        (cd "$PROJECT_DIR/agentcore/cdk" && npm install --no-audit --no-fund)
+    fi
+
     # Ensure aws-targets.json exists (agentcore CDK requires it).
     if [ ! -f "$PROJECT_DIR/agentcore/aws-targets.json" ]; then
         info "Generating agentcore/aws-targets.json from current AWS credentials …"

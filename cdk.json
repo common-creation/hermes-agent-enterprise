@@ -29,9 +29,10 @@
     "enable_token_monitoring": true,
     "daily_token_budget": 100000000,
     "daily_cost_budget_usd": 100,
-
-    "channels": ["slack"],
-
+    "channels": [
+      "slack"
+    ],
+    "allow_all_slack_users": false,
     "vpc_cidr": "10.0.0.0/16",
     "az_count": 2,
     "alarm_email": "",
